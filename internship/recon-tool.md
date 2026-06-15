@@ -80,3 +80,36 @@ would need a longer timeout or a reduced template set).
   subdomains in addition to the root domain (previously it only scanned the
   root domain).
 - Full report: `scanme.nmap.org_report.txt` in the recon-tool repo.
+
+## Update — full scan run (with nuclei + ffuf)
+
+A later run completed without nuclei timing out, surfacing real findings:
+
+### Vulnerabilities found
+- **CVE-2023-48795 (Terrapin attack)** — medium severity, affects the SSH
+  protocol implementation on this host due to an outdated OpenSSH version.
+- **Weak SSH cryptography** — weak MAC algorithms, CBC-mode ciphers, and a
+  weak key exchange algorithm (Diffie-Hellman/Logjam) are all supported by
+  this server's SSH config.
+- **Outdated software versions identified**: `Apache/2.4.7 (Ubuntu)` and
+  `OpenSSH_6.6.1p1` — both old versions, which is the root cause of the
+  above findings.
+- **All modern security headers missing** on the website (CSP,
+  X-Frame-Options, Strict-Transport-Security, etc.) — leaves the site more
+  exposed to clickjacking/XSS-style attacks.
+
+### ffuf (directory/file brute-forcing) — new active testing stage
+Added ffuf as an 8th stage: brute-forces common file/directory names against
+each live host (`/admin`, `/.env`, `/.git`, `/backup.zip`, etc).
+
+On this target it flagged `images`, `.svn`, `.htaccess`, and `.htpasswd` as
+existing — but manually checking each returned **403 Forbidden**, meaning
+the files exist on the server but Apache correctly blocks direct access.
+Useful distinction: ffuf reports *existence* (anything other than a 404),
+not *readability* — a 403 means "found but protected," not "exposed."
+
+### Takeaway
+This run is a more realistic example of what the tool surfaces on a system
+with actual outdated software — a documented CVE, weak crypto config, and
+missing hardening headers, none of which were visible in the first
+(near-empty) run.
