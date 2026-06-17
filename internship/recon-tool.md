@@ -108,8 +108,38 @@ the files exist on the server but Apache correctly blocks direct access.
 Useful distinction: ffuf reports *existence* (anything other than a 404),
 not *readability* — a 403 means "found but protected," not "exposed."
 
+# Running a Recon Pipeline From a Foreign VPS: A Resource-Constrained Walkthrough
+
+## Context
+
+As part of OPSEC fundamentals for the internship (IP masking, system masking, standalone foreign infrastructure), the goal was to take an existing recon tool — a Python script chaining subfinder, httpx, naabu, tlsx, nuclei, dnstwist, checkdmarc, and ffuf — and run it from infrastructure with zero ties to my personal identity or network.
+
+The plan: a free-tier AWS EC2 instance (Ubuntu, t2/t3.micro, London region), with the full toolchain installed and the script run natively on the box, so every outbound request genuinely originates from that server's IP.
+
+## Problem 1: Disk space
+
+Installing five Go-based tools via `go install` compiles each one from source, which downloads a full dependency tree and writes substantial temporary build files. On an 8GB root volume, this ran the disk to 92% capacity, and a build silently failed mid-compile. Worth noting: a separate `/tmp` partition (`tmpfs`, capped independently of the root disk) hit its own limit shortly after, throwing a more specific "disk quota exceeded" rather than the generic "no space left on device" — same underlying cause, different reported symptom.
+
+**Fix:** cleared the Go build cache (`go clean -cache`) as a stopgap, then properly resized the EBS volume from 8GB → 20GB via the AWS console, followed by `growpart` and `resize2fs` to extend the actual filesystem to match.
+
+## Problem 2: Memory
+
+With disk sorted, the heaviest tool (nuclei) still failed to compile, this time with `signal: killed`, the kernel's OOM killer terminating the process outright. The instance only has ~900MB of RAM total, free-tier minimum.
+
+**Fix:** added a swap file as backup memory. First attempt (512MB) wasn't enough; bumped to 2GB once disk space allowed it.
+
+## The pivot
+
+Rather than continuing to fight a build process that was fundamentally too heavy for the hardware, switched strategy entirely: downloaded prebuilt release binaries directly from each project's GitHub releases instead of compiling from source. This sidesteps both failure modes simultaneously, since there's no compiler running, there's nothing to run out of memory or disk mid-build.
+
+## A runtime gotcha worth noting
+
+Even after installation succeeded, nuclei's full default template set (10,000+ checks) against a real target with hundreds of subdomains was too heavy for this hardware to complete in reasonable time, single CPU, ~900MB RAM. Scoping the scan to `-severity critical,high` cut the workload dramatically and made it tractable. Also discovered that swap doesn't survive an instance reboot unless reactivated manually (`sudo swapon`), worth checking after any reboot mid-task.
+
 ### Takeaway
 This run is a more realistic example of what the tool surfaces on a system
 with actual outdated software — a documented CVE, weak crypto config, and
 missing hardening headers, none of which were visible in the first
 (near-empty) run.
+
+Free-tier hardware constraints aren't a footnote, they actively shape what's operationally realistic to run somewhere. Diagnosing *which* resource is the bottleneck (disk vs. memory vs. compute) before reaching for a fix mattered more than any individual command — the same error class ("ran out of room") had two completely different root causes depending on where in the pipeline it showed up.
