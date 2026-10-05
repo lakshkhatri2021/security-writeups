@@ -1,145 +1,131 @@
-# Attack Surface Recon — scanme.nmap.org
+# Attack Surface Recon: scanme.nmap.org
 
 ## Overview
 
-Ran my recon tool (https://github.com/lakshkhatri2021/recon-tool) against
-`scanme.nmap.org`, the official public test host maintained by the Nmap
-project for people to practice scanning on. The tool chains subfinder,
-httpx, naabu, tlsx, dnstwist, checkdmarc, and nuclei to map external exposure
-for a domain.
+I took an existing Python recon script and rewrote it into [recon-tool](https://github.com/lakshkhatri2021/recon-tool). It chains subfinder, httpx, naabu, tlsx, dnstwist, checkdmarc, nuclei and ffuf to map the external exposure of a domain.
 
-## Results
+This writeup has two parts. Part 1 covers running it against `scanme.nmap.org`, the public test host maintained by the Nmap project. Part 2 covers running the same pipeline from a free-tier AWS VPS and the resource problems I hit.
 
-### 1. Subdomain enumeration (subfinder)
-0 subdomains found. Expected — `scanme.nmap.org` is a single standalone test
-host, not a company with sprawling infrastructure, so passive sources
-(Certificate Transparency logs, DNS aggregators etc) have nothing indexed
-under it.
+## Scope and authorisation
 
-### 2. Live host probing (httpx)
+scanme.nmap.org is run by the Nmap project, and its page authorises scanning with Nmap or other port scanners and asks users not to hammer it. The port scanning, DNS and email stages here fall inside that. The nuclei and ffuf stages go beyond plain port scanning, so I treat this as a one-off. Web-layer testing like this should be done against systems I own, such as an intentionally vulnerable app on my own VPS.
+
+## Changes I made to the original script
+
+- Removed a hardcoded local path.
+- Added proper error handling per stage.
+- Fixed a shell-injection issue in how subdomain lists were piped into httpx and nuclei.
+- Made naabu scan discovered subdomains as well as the root domain (previously it only scanned the root).
+- Added ffuf as an 8th stage for directory and file brute-forcing.
+
+The full report is `scanme.nmap.org_report.txt` in the recon-tool repo.
+
+# Part 1: Results
+
+## 1. Subdomain enumeration (subfinder)
+
+0 subdomains found. This was expected: `scanme.nmap.org` is a single standalone test host, not a company with sprawling infrastructure, so passive sources (Certificate Transparency logs, DNS aggregators and so on) have nothing indexed under it.
+
+## 2. Live host probing (httpx)
+
 `http://scanme.nmap.org` confirmed live on HTTP.
 
-### 3. Port scanning (naabu)
+## 3. Port scanning (naabu)
+
 Two ports open:
 - **22 (SSH)**
 - **80 (HTTP)**
 
-Port 443 (HTTPS) is not open — confirmed in the next step.
+Port 443 (HTTPS) is not open, which the next step confirmed.
 
-### 4. TLS inspection (tlsx)
-No TLS data returned. Since port 443 isn't open, there's no certificate to
-inspect. This means any traffic to this host over HTTP is unencrypted.
+## 4. TLS inspection (tlsx)
 
-### 5. Typosquatting detection (dnstwist)
-Generated hundreds of lookalike domain permutations (homoglyphs, bitsquats,
-insertions, hyphenations etc). A handful are actually registered and resolve,
-e.g.:
-- `scanme.nmapd.org` → parked via cashparking.com
-- `scanme.nmaps.org` → parked via parkingcrew.net
-- `scanme.nmal.org`, `scanme.nmsp.org`, several `afternic.com`-parked domains
+No TLS data returned. Since port 443 isn't open, there's no certificate to inspect, which means any traffic to this host over HTTP is unencrypted.
 
-These are domain-parking services, not active phishing infrastructure, but
-this is exactly the category of finding that matters for a real company —
-if any of these were actively serving content mimicking the original site,
-it would be a strong phishing indicator.
+## 5. Typosquatting detection (dnstwist)
 
-### 6. Email security (checkdmarc)
-- **SPF**: not configured — no SPF record exists.
-- **DMARC**: not configured.
-- **DKIM**: not checked directly by this tool, but absence of DMARC means
-  no enforcement policy exists either way.
-- **MTA-STS / BIMI**: also not configured.
+Generated hundreds of lookalike domain permutations (homoglyphs, bitsquats, insertions, hyphenations and so on). A handful are registered and resolve, for example:
+- `scanme.nmapd.org`, parked via cashparking.com
+- `scanme.nmaps.org`, parked via parkingcrew.net
+- `scanme.nmal.org`, `scanme.nmsp.org` and several `afternic.com`-parked domains
 
-This means email claiming to be from `@scanme.nmap.org` (or `@nmap.org`)
-has no authentication framework backing it — in a real org, this is a
-direct enabler for email spoofing / business email compromise.
+These are domain-parking services, not active phishing infrastructure. But this is exactly the category of finding that matters for a real company: if any of these were serving content that mimicked the original site, it would be a strong phishing indicator.
 
-### 7. Vulnerability scanning (nuclei)
-Timed out after 5 minutes against the single live host (nuclei runs 10,000+
-templates, so this is expected on a full run — for production use this stage
-would need a longer timeout or a reduced template set).
+## 6. Email security (checkdmarc)
+
+- **SPF:** not configured, no SPF record exists.
+- **DMARC:** not configured.
+- **DKIM:** not checked directly by this tool, but with no DMARC there is no enforcement policy either way.
+- **MTA-STS and BIMI:** also not configured.
+
+Email claiming to be from `@scanme.nmap.org` (or `@nmap.org`) has no authentication backing it. In a real organisation this directly enables email spoofing and business email compromise.
+
+## 7. Vulnerability scanning (nuclei)
+
+The first run timed out after 5 minutes against the single live host, which is expected because nuclei runs 10,000+ templates. A later full run completed and found:
+
+- **CVE-2023-48795 (Terrapin attack):** medium severity, affects the SSH protocol implementation on this host because of an outdated OpenSSH version.
+- **Weak SSH cryptography:** weak MAC algorithms, CBC-mode ciphers and a weak key exchange (Diffie-Hellman, Logjam-style) are all supported by the server's SSH config.
+- **Outdated software:** `Apache/2.4.7 (Ubuntu)` and `OpenSSH_6.6.1p1`. Both are old, which explains the CVE and the weak default algorithm lists.
+- **Missing security headers:** CSP, X-Frame-Options, Strict-Transport-Security and others are all absent, which leaves the site more exposed to clickjacking and XSS-style attacks.
+
+## 8. Directory and file brute-forcing (ffuf)
+
+ffuf tries common file and directory names against each live host (`/admin`, `/.env`, `/.git`, `/backup.zip` and so on). On this target it flagged `images`, `.svn`, `.htaccess` and `.htpasswd` as existing. Checking each one manually returned **403 Forbidden**, meaning the files exist but Apache correctly blocks direct access.
+
+The distinction matters: ffuf reports that something exists (anything other than a 404), not that it's readable. A 403 means "found but protected", not "exposed".
 
 ## Key takeaways
 
-- This host has a genuinely minimal external footprint — one live service
-  over plaintext HTTP, SSH open, no TLS, no email auth records.
-- For a real target, the most actionable findings from this run alone would
-  be: (1) no SPF/DMARC — fix immediately, it's a five-minute DNS change with
-  major impact on phishing risk, and (2) HTTP-only with no TLS — anything
-  transmitted is plaintext.
-- The dnstwist results show why typosquat monitoring matters even for small
-  targets — parked lookalike domains exist for almost any domain name, and
-  monitoring which ones become "live" over time is a useful early-warning
-  signal for phishing campaigns.
+- A quick first pass can understate exposure. The early run made the host look nearly empty (one live service over plaintext HTTP, SSH open, no TLS, no email authentication). The full run with nuclei and ffuf found a documented CVE, weak SSH crypto, outdated software and missing security headers.
+- The most serious finding was Terrapin (CVE-2023-48795) on an outdated OpenSSH, alongside weak MACs, CBC ciphers and a weak key exchange.
+- No SPF or DMARC is the most actionable finding for a real target. It's a five-minute DNS change with a major effect on phishing and spoofing risk.
+- HTTP-only with no TLS means anything transmitted is plaintext.
+- Typosquat monitoring matters even for small targets. Parked lookalike domains exist for almost any domain name, and watching which ones go live over time is a useful early warning for phishing campaigns.
 
-## Tool notes / improvements made
+## Recommended fixes
 
-- Rewrote the original script to remove a hardcoded local path, add proper
-  error handling per stage, fix a shell-injection issue in how subdomain
-  lists were piped into httpx/nuclei, and make naabu scan discovered
-  subdomains in addition to the root domain (previously it only scanned the
-  root domain).
-- Full report: `scanme.nmap.org_report.txt` in the recon-tool repo.
+1. **Upgrade OpenSSH** to a current release (9.6 or later fixes Terrapin) and update Apache from 2.4.7.
+2. **Harden SSH crypto:** disable CBC ciphers, weak MAC algorithms and the weak Diffie-Hellman key exchange groups.
+3. **Add security headers:** Content-Security-Policy, X-Frame-Options and Strict-Transport-Security.
+4. **Enable HTTPS** on port 443 and redirect HTTP to it.
+5. **Publish SPF and DMARC records** so spoofed email from the domain is rejected.
+6. **Monitor typosquat domains** and act if any start serving content that mimics the real site.
 
-## Update — full scan run (with nuclei + ffuf)
+---
 
-A later run completed without nuclei timing out, surfacing real findings:
-
-### Vulnerabilities found
-- **CVE-2023-48795 (Terrapin attack)** — medium severity, affects the SSH
-  protocol implementation on this host due to an outdated OpenSSH version.
-- **Weak SSH cryptography** — weak MAC algorithms, CBC-mode ciphers, and a
-  weak key exchange algorithm (Diffie-Hellman/Logjam) are all supported by
-  this server's SSH config.
-- **Outdated software versions identified**: `Apache/2.4.7 (Ubuntu)` and
-  `OpenSSH_6.6.1p1` — both old versions, which is the root cause of the
-  above findings.
-- **All modern security headers missing** on the website (CSP,
-  X-Frame-Options, Strict-Transport-Security, etc.) — leaves the site more
-  exposed to clickjacking/XSS-style attacks.
-
-### ffuf (directory/file brute-forcing) — new active testing stage
-Added ffuf as an 8th stage: brute-forces common file/directory names against
-each live host (`/admin`, `/.env`, `/.git`, `/backup.zip`, etc).
-
-On this target it flagged `images`, `.svn`, `.htaccess`, and `.htpasswd` as
-existing — but manually checking each returned **403 Forbidden**, meaning
-the files exist on the server but Apache correctly blocks direct access.
-Useful distinction: ffuf reports *existence* (anything other than a 404),
-not *readability* — a 403 means "found but protected," not "exposed."
-
-# Running a Recon Pipeline From a Foreign VPS: A Resource-Constrained Walkthrough
+# Part 2: Running the pipeline from a foreign VPS
 
 ## Context
 
-As part of OPSEC fundamentals for the internship (IP masking, system masking, standalone foreign infrastructure), the goal was to take an existing recon tool — a Python script chaining subfinder, httpx, naabu, tlsx, nuclei, dnstwist, checkdmarc, and ffuf — and run it from infrastructure with zero ties to my personal identity or network.
+As part of OPSEC fundamentals for the internship (IP masking, system masking, standalone foreign infrastructure), the goal was to take the recon script and run it from a server whose IP isn't linked to my home network. The AWS account is still tied to my billing details, so this hides my network location, not my identity.
 
-The plan: a free-tier AWS EC2 instance (Ubuntu, t2/t3.micro, London region), with the full toolchain installed and the script run natively on the box, so every outbound request genuinely originates from that server's IP.
+The plan was a free-tier AWS EC2 instance (Ubuntu, t2/t3.micro, London region) with the full toolchain installed and the script run natively on the box, so every outbound request genuinely originates from that server's IP.
 
 ## Problem 1: Disk space
 
-Installing five Go-based tools via `go install` compiles each one from source, which downloads a full dependency tree and writes substantial temporary build files. On an 8GB root volume, this ran the disk to 92% capacity, and a build silently failed mid-compile. Worth noting: a separate `/tmp` partition (`tmpfs`, capped independently of the root disk) hit its own limit shortly after, throwing a more specific "disk quota exceeded" rather than the generic "no space left on device" — same underlying cause, different reported symptom.
+Installing five Go-based tools with `go install` compiles each one from source, which downloads a full dependency tree and writes substantial temporary build files. On an 8GB root volume this ran the disk to 92% capacity, and a build silently failed mid-compile.
 
-**Fix:** cleared the Go build cache (`go clean -cache`) as a stopgap, then properly resized the EBS volume from 8GB → 20GB via the AWS console, followed by `growpart` and `resize2fs` to extend the actual filesystem to match.
+A separate `/tmp` partition (`tmpfs`, capped independently of the root disk) hit its own limit shortly after, throwing a more specific "disk quota exceeded" instead of the generic "no space left on device". The cause was the same, but the reported symptom was different.
+
+**Fix:** cleared the Go build cache (`go clean -cache`) as a stopgap, then properly resized the EBS volume from 8GB to 20GB in the AWS console, followed by `growpart` and `resize2fs` to extend the actual filesystem to match.
 
 ## Problem 2: Memory
 
-With disk sorted, the heaviest tool (nuclei) still failed to compile, this time with `signal: killed`, the kernel's OOM killer terminating the process outright. The instance only has ~900MB of RAM total, free-tier minimum.
+With disk sorted, the heaviest tool (nuclei) still failed to compile, this time with `signal: killed`, which is the kernel's out-of-memory killer terminating the process. The instance only has about 900MB of RAM, the free-tier minimum.
 
-**Fix:** added a swap file as backup memory. First attempt (512MB) wasn't enough; bumped to 2GB once disk space allowed it.
+**Fix:** added a swap file as backup memory. The first attempt (512MB) wasn't enough, so I increased it to 2GB once disk space allowed.
 
 ## The pivot
 
-Rather than continuing to fight a build process that was fundamentally too heavy for the hardware, switched strategy entirely: downloaded prebuilt release binaries directly from each project's GitHub releases instead of compiling from source. This sidesteps both failure modes simultaneously, since there's no compiler running, there's nothing to run out of memory or disk mid-build.
+Rather than keep fighting a build process that was too heavy for the hardware, I switched strategy and downloaded prebuilt release binaries directly from each project's GitHub releases instead of compiling from source. This avoids both failure modes at once: with no compiler running, there's nothing to run out of memory or disk mid-build.
 
-## A runtime gotcha worth noting
+## A runtime gotcha
 
-Even after installation succeeded, nuclei's full default template set (10,000+ checks) against a real target with hundreds of subdomains was too heavy for this hardware to complete in reasonable time, single CPU, ~900MB RAM. Scoping the scan to `-severity critical,high` cut the workload dramatically and made it tractable. Also discovered that swap doesn't survive an instance reboot unless reactivated manually (`sudo swapon`), worth checking after any reboot mid-task.
+Even after installation succeeded, nuclei's full default template set (10,000+ checks) against a target with hundreds of subdomains was too heavy for this hardware, with a single CPU and about 900MB of RAM. Scoping the scan to `-severity critical,high` cut the workload dramatically and made it manageable.
 
-### Takeaway
-This run is a more realistic example of what the tool surfaces on a system
-with actual outdated software — a documented CVE, weak crypto config, and
-missing hardening headers, none of which were visible in the first
-(near-empty) run.
+I also found that swap doesn't survive an instance reboot unless it's reactivated manually (`sudo swapon`), so it's worth checking after any reboot mid-task.
 
-Free-tier hardware constraints aren't a footnote, they actively shape what's operationally realistic to run somewhere. Diagnosing *which* resource is the bottleneck (disk vs. memory vs. compute) before reaching for a fix mattered more than any individual command — the same error class ("ran out of room") had two completely different root causes depending on where in the pipeline it showed up.
+## Takeaway
+
+Free-tier hardware constraints aren't a footnote, they actively shape what's realistic to run somewhere. Working out which resource was the bottleneck (disk, memory or compute) before reaching for a fix mattered more than any individual command. The same error class ("ran out of room") had two completely different root causes depending on where in the pipeline it showed up.
